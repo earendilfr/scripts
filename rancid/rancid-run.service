@@ -1,0 +1,13 @@
+[Unit]
+Description=Run rancid-run
+AssertFileIsExecutable=/opt/rancid/bin/rancid-run
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=netdisco
+Group=netdisco
+Environment="RANCID_GROUP=fhvi"
+ExecStart=/opt/rancid/bin/rancid-run
+ExecStartPost=-/opt/netdisco/.local/bin/rancid-clean
+

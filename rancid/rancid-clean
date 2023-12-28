@@ -1,0 +1,103 @@
+#!/bin/bash
+#
+# RANCID clean-up directory for old save file
+#
+
+ENVFILE="/opt/rancid/etc/rancid.conf"
+COMMIT_MSG="Clean up performed by RANCID Clean-Up"
+AGE=180
+TRY=0
+LOGGER="logger -t rancid_clean"
+DEBUG=0
+
+# print a usage message to stderr
+pr_usage() {
+    cat <<EOF
+usage: $0 [-Vhtd] [-f config_file] [-l max_age ] [-c \"commit message\"] [group [group ...]]
+  -f <path>: path to rancid config file (default: /opt/rancid/etc/rancid.conf)
+  -l <days>: age of file to remove (default: 180 days)
+  -c <msg>: Commit message for the clean-up in RANCID repo (default: Clean up performed by RANCID Clean-Up)
+  -t: only try but not delete
+  -d: print debug message
+  -V: print version
+  -h: print this help
+
+  group [group]: list of groups to clean (default: all groups listed in rancid.conf file)
+EOF
+}
+
+OPTIND=1
+while getopts "Vhtf:l:c:" opt; do
+    case "$opt" in
+        V)
+            printf "RANCID Clean Up v0.1\n"
+            exit 0
+            ;;
+        h)
+            pr_usage
+            exit 0
+            ;;
+        f)
+            # next arg is the alternate config file name
+            [ -f "$OPTARG"] && ENVFILE="$OPTARG"
+            ;;
+        l)
+            # next arg is the max age to remove
+            [ ! -z "${OPTARG##*[!0-9]*}" ] && AGE="$OPTARG"
+            ;;
+        t)
+            # indicate to perfrom try (only display which files will be deleted
+            TRY=1
+            ;;
+        d)
+            DEBUG=1
+            LOGGER="logger -t rancid_clean --stderr"
+            ;;
+        c)
+            # next arg is the commit message
+            [ -n "$OPTARG" ] && COMMIT_MSG="$OPTARG"
+            ;;
+        *)
+            print_usage
+            exit 1
+            ;;
+    esac
+done
+shift "$((OPTIND - 1))"
+
+. "$ENVFILE"
+
+if [ $# -ge 1 ] ; then
+    LIST_OF_GROUPS="$*"; export LIST_OF_GROUPS
+elif [ -z "$LIST_OF_GROUPS" ] ; then
+    $LOGGER "LIST_OF_GROUPS is empty in $ENVFILE"
+    exit 2
+fi
+
+for GROUP in $LIST_OF_GROUPS; do
+    LOCKFILE="$TMPDIR/.$GROUP.clean_run.lock"
+    if [ ! -f "$LOCKFILE" ]; then
+        cd "$BASEDIR/$GROUP"
+        COUNT=0
+        find "$BASEDIR/$GROUP/configs/" -type f -a \( -mtime +$AGE -o -size 0 -a -mtime +1 \) -a ! -regex '^.*/\..*' -printf '%f:%h\n' | while IFS=':' read name dir; do
+            group=$(basename $dir)
+            if [ $(\grep -cP "^$name;.*;$group$" "$BASEDIR/$GROUP/router.db") -eq 0 ]; then
+                COMMIT_MSG="${COMMIT_MSG}\n${name} deleted"
+                [ "$TRY" -eq 0 ] && rm "$dir/$name" || printf "File $dir/$name wil be deleted\n"
+            fi
+            COUNT=$((COUNT + 1))
+        done
+        if [ "$TRY" -eq 0 -a $COUNT -gt 0 ]; then
+            $LOGGER "== Modification commited for group ${GROUP} =="
+            git add .
+            git commit -m "$COMMIT_MSG" -a
+            git push
+        elif [ $COUNT -eq 0 ]; then
+            $LOGGER "== No files to clean in group ${GROUP} =="
+        fi
+    else
+        $LOGGER "Clean up locked for group ${GROUP}"
+    fi
+done
+
+# vim: set tabstop=4 expandtab:

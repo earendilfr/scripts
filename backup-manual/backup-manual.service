@@ -1,0 +1,11 @@
+[Unit]
+Description=Run rancid-run
+AssertFileIsExecutable=/opt/netdisco/.local/bin/backup-manual
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=netdisco
+Group=netdisco
+ExecStart=/opt/netdisco/.local/bin/backup-manual
+ExecStartPost=-/opt/netdisco/.local/bin/backup-clean

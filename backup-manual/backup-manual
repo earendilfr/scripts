@@ -1,0 +1,251 @@
+#!/bin/bash
+
+############################################################
+# Variables definition
+MAN_BACK="/opt/manual"
+RANCID_DATA="/opt/rancid/var"
+RANCID_BIN="/opt/rancid/bin"
+TRY=0
+DEBUG=0
+MIN_COUNT=7
+MAX_AGE=7
+STDDBG="> /dev/null 2>&1"
+VERSION=0.4
+LOGGER="logger -t backup_manual"
+USE_SFTP=1
+USE_SCP=0
+USE_FTP=1
+BACK_SRV="$(hostname --all-ip-addresses | tr -d '[:space:]')"
+BACK_SRV_IP="10.132.65.10"
+# If your server has multiple interfaces, you can try the following command:
+#BACK_SRV="$(ip -4 -j addr show dev $(ip route | awk '/default/{print $3}') scope global | jq -r '.[]["addr_info"][]["local"]')"
+# Explain:
+#   - retrive the interface that takeover the default route
+#   - Get IPv4 info for this interface
+#   - Filter output to only display the IPv4
+BACK_USR="<TO BE INDICATED>"
+BACK_PWD="<TO BE INDICATED>"
+BACK_FTP_USR="<TO BE INDICATED>"
+BACK_FTP_PWD="<TO BE INDICATED>"
+
+# Recommended configuration on SSHd server
+# Warning: this configuration forbid the usage of old SCP to transfert files
+#
+#Match User netdisco
+#   ForceCommand internal-sftp
+#   ChrootDirectory /opt/manual
+#   AllowTcpForwarding no
+#
+
+############################################################
+# Common functions
+print_usage() {
+    printf "usage: $0 [-V] [-h] [-d] [-t] [-a <age>] [-c <dir>]\n"
+    printf "  -r <dir>: Directory where rancid is installed (default: ${RANCID_BIN})\n"
+    printf "  -c <dir>: directory where are located the backup file (default: ${MAN_BACK})\n"
+    printf "  -f <name>: only backup the device with this name. Backup all if not set\n"
+    printf "  -t: only try but not delete\n"
+    printf "  -d: print debug message\n"
+    printf "  -V: print version\n"
+    printf "  -h: print this help\n"
+}
+
+
+############################################################
+# Read CLI parameters
+OPTIND=1
+while getopts "Vhtdr:c:f:" opt; do
+    case "$opt" in
+        V)
+            printf "$0 $VERSION\n"
+            exit 0
+            ;;
+        h)
+            print_usage
+            exit 0
+            ;;
+        t)
+            # indicate to perfrom try (only display which files will be deleted
+            TRY=1
+            ;;
+        d)
+            DEBUG=1
+            LOGGER="logger -t backup_manual --stderr"
+            STDDBG=""
+            ;;
+        r)
+            # next arg is the rancid backup directory
+            [-d "${OPTARG}/bin" ] && RANCID_BIN="${OPTARG}/bin"
+            ;;
+        c)
+            # next arg is the backup directory
+            [ -d "${OPTARG}" ] && MAN_BACK="${OPTARG}"
+            ;;
+        f)
+            # next arg is the name of device to backup
+            FILTER_DEV="${OPTARG}"
+            ;;
+        *)
+            print_usage $0
+            exit 1
+            ;;
+    esac
+done
+shift "$((OPTIND - 1))"
+
+##############################################################
+# Specific backup fonctions for supported devices
+
+# Generate copy command for linux like devices
+gen_copy_cmd() {
+    LOCAL_FILE=$1
+    LOCAL_DIR=$2
+    REM_DIR=$3
+    
+    if [ "$USE_SFTP" -eq 1 ]; then
+        l_COPY_CMD="echo \"put ${LOCAL_DIR}/${LOCAL_FILE} ${REM_DIR}\" | sftp -i /root/.ssh/rancid_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BindAddress=\\\$(ip -4 addr show mgmt | grep -oP \"(?<=inet ).*(?=/)\") ${BACK_USR}@${BACK_SRV}"
+    elif [ "$USE_SCP" -eq 1 ]; then
+        l_COPY_CMD="scp -i /root/.ssh/rancid_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BindAddress=\\\$(ip -4 addr show mgmt | grep -oP \"(?<=inet ).*(?=/)\") ${LOCAL_DIR}/${LOCAL_FILE} ${BACK_USR}@${BACK_SRV}:${REM_DIR}"
+    else
+        echo "ERROR: USE_SFTP or USE_SCP variable should be defined at 1 to use this function"
+        exit 1
+    fi
+}
+
+# BigIP (F5) devices
+bigip_backup() {
+    DIR=$1
+    DEV=$(echo $2 | tr '[:upper:]' '[:lower:]')
+
+    # Perform backup
+    $LOGGER "Manuel backup for device ${DEV}"
+    l_BACKUP_FILE="${DEV}_$(date +%Y%m%d)"
+
+    if [ -f "${DIR}/${l_BACKUP_FILE}.ucs" ]; then
+        if [ "$(($(date +%s) - $(stat -c %Y "${DIR}/${l_BACKUP_FILE}.ucs")))" -lt $((24*60*60)) ]; then
+            $LOGGER "Backup file for device ${DEV} already exist"
+            return
+        fi
+    fi
+    
+    gen_copy_cmd "${l_BACKUP_FILE}.ucs" "/var/tmp/" "./$(basename ${DIR})"
+    l_CMD="${RANCID_BIN}/clogin -t 600 -c 'tmsh save /sys ucs /var/tmp/${l_BACKUP_FILE}.ucs > /dev/null;${l_COPY_CMD};rm -f /var/tmp/${l_BACKUP_FILE}.ucs' ${DEV} ${STDDBG}"
+    if [ $TRY -eq 0 ]; then
+        eval ${l_CMD}
+        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}.ucs" ] && $LOGGER "Backup for device ${DEV} fail" || $LOGGER "Backup for device ${DEV} successfull"
+    else
+        printf "${l_CMD}\n"
+    fi
+
+    # Remove empty files if required
+    find "$DIR" -empty -and -type f -delete
+    
+}
+
+# Citrix Netscaler
+netscaler_backup() {
+    DIR=$1
+    DEV=$(echo $2 | tr '[:upper:]' '[:lower:]')
+
+    # Perform backup
+    $LOGGER "Manual backup for device ${DEV}"
+    l_BACKUP_FILE="${DEV}_$(date +%Y%m%d)"
+
+    if [ -f "${DIR}/${l_BACKUP_FILE}.tgz" ]; then
+        if [ "$(($(date +%s) - $(stat -c %Y "${DIR}/${l_BACKUP_FILE}.tgz")))" -lt $((24*60*60)) ]; then
+            $LOGGER "Backup file for device ${DEV} already exist"
+            return
+        fi
+    fi
+
+    l_COPY_CMD=gen_copy_cmd "${l_BACKUP_FILE}.tgz" "/var/ns_sys_backup/" "${DIR}"
+    l_CMD="${RANCID_BIN}/nslogin -t 600 -c 'rm system backup ${DEV}_$(date --date=yesterday +%Y%m%d).tgz;create system backup ${l_BACKUP_FILE} -level full;shell;${l_COPY_CMD};rm system backup ${DEV}_$(date +%Y%m%d).tgz;logout' ${DEV} ${STDDBG}"
+    if [ $TRY -eq 0 ]; then
+        eval ${l_CMD}
+        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}.tgz" ] && $LOGGER "Backup for device ${DEV} fail" || $LOGGER "Backup for device ${DEV} successfull"
+    else
+        printf "${l_CMD}\n"
+    fi
+
+    # Remove empty files if required
+    find "$DIR" -empty -and -type f -delete
+
+}
+
+# Fortigate firewall
+fortigate_backup() {
+    DIR="$1"
+    DEV=$(echo $2 | tr '[:upper:]' '[:lower:]')
+
+    # Perform backup
+    $LOGGER "Manuel backup for device ${DEV}"
+    l_BACKUP_FILE="${DEV}_$(date +%Y%m%d)"
+
+    if [ -f "${DIR}/${l_BACKUP_FILE}" ]; then
+        if [ "$(($(date +%s) - $(stat -c %Y "${DIR}/${l_BACKUP_FILE}")))" -lt $((24*60*60)) ]; then
+            $LOGGER "Backup file for device ${DEV} already exist"
+            return
+        fi
+    fi
+
+    l_CMD="${RANCID_BIN}/fnlogin -t 600 -c 'config global;execute backup config ftp /$(basename ${DIR})/${l_BACKUP_FILE} ${BACK_SRV} ${BACK_FTP_USR} ${BACK_FTP_PWD}' ${DEV} ${STDDBG}"
+    if [ $TRY -eq 0 ]; then
+        eval ${l_CMD}
+        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}" ] && $LOGGER "Backup for device ${DEV} fail" || $LOGGER "Backup for device ${DEV} successfull"
+    else
+        printf "${l_CMD}\n"
+    fi
+
+    # Remove empty files if required
+    find "$DIR" -empty -and -type f -delete
+
+}
+
+aruba_backup() {
+    DIR="$1"
+    DEV=$(echo $2 | tr '[:upper:]' '[:lower:]')
+
+    # Perform backup
+    $LOGGER "Manuel backup for device ${DEV}"
+    l_BACKUP_FILE="${DEV}_$(date +%Y%m%d)"
+
+    if [ -f "${DIR}/${l_BACKUP_FILE}.tar.gz" ]; then
+        if [ "$(($(date +%s) - $(stat -c %Y "${DIR}/${l_BACKUP_FILE}.tar.gz")))" -lt $((24*60*60)) ]; then
+            $LOGGER "Backup file for device ${DEV} already exist"
+            return
+        fi
+    fi
+
+    l_CMD="${RANCID_BIN}/clogin -t 600 -c 'backup flash;copy flash: flashbackup.tar.gz ftp: ${BACK_SRV_IP} ${BACK_FTP_USR} /$(basename ${DIR}) ${l_BACKUP_FILE}.tar.gz;${BACK_FTP_PWD};delete filename flashbackup.tar.gz' ${DEV} ${STDDBG}"
+    if [ $TRY -eq 0 ]; then
+        eval ${l_CMD}
+        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}.tar.gz" ] && $LOGGER "Backup for device ${DEV} fail" || $LOGGER "Backup for device ${DEV} successfull"
+    else
+        printf "${l_CMD}\n"
+    fi
+
+    # Remove empty files if required
+    find "$DIR" -empty -and -type f -delete
+
+}
+
+############################################################
+# Main functions
+
+
+[ ! -d "${MAN_BACK}" ] && mkdir -p "${MAN_BACK}"
+
+for FILE in $(find "${RANCID_DATA}/" -mindepth 1 -maxdepth 2 -type f -iname '*router.db' | sort); do
+    while IFS=';' read -r device type other; do
+        if [ -n "${FILTER_DEV}" ] && [ "${device}" != "${FILTER_DEV}" ]; then
+            continue
+        fi
+        type ${type}_backup > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            [ ! -d "${MAN_BACK}/${type}" ] && mkdir -p "${MAN_BACK}/${type}"
+            ${type}_backup "${MAN_BACK}/${type}" "${device}"
+        fi
+    done < "${FILE}"
+done
+
+# vim: tabstop=4 expandtab

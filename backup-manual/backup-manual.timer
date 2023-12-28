@@ -1,0 +1,10 @@
+[Unit]
+Description=Run rancid-run every day
+
+[Timer]
+OnBootSec=1min
+OnCalendar=*-*-* 3:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

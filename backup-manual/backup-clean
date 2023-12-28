@@ -1,0 +1,134 @@
+#!/bin/bash
+#
+# Manual backup clean-up directory for old save file
+#
+
+AGE=14
+MIN_COUNT=7
+MAN_BACK="/opt/manual"
+TRY=0
+DEBUG=0
+VERSION=0.2
+
+print_usage() {
+    printf "usage: $0 [-V] [-h] [-d] [-t] [-a <age>] [-c <dir>]\n"
+    printf "  -a <age>: mac age to keep backup (default: 30)\n"
+    printf "  -c <dir>: directory where are located the backup file\n"
+    printf "  -t: only try but not delete\n"
+    printf "  -d: print debug message\n"
+    printf "  -V: print version\n"
+    printf "  -h: print this help\n"
+}
+
+OPTIND=1
+while getopts "Vha:tdc:" opt; do
+    case "$opt" in
+        V)
+            printf "$0 $VERSION\n"
+            exit 0
+            ;;
+        h)
+            print_usage
+            exit 0
+            ;;
+        a)
+            # next arg is the max age to remove
+            [ ! -z "${OPTARG##*[!0-9]*}" ] && AGE="$OPTARG"
+            ;;
+        t)
+            # indicate to perfrom try (only display which files will be deleted
+            TRY=1
+            ;;
+        d)
+            DEBUG=1
+            ;;
+        c)
+            # next arg is the backup directory
+            [ -d "$OPTARG" ] && MAN_BACK="$OPTARG"
+            ;;
+        *)
+            print_usage $0
+            exit 1
+            ;;
+    esac
+done
+shift "$((OPTIND - 1))"
+
+backup_clean_ise() {
+  DIR=$1
+  for DEV in $(ls -1 $DIR | perl -ne 'print "$1\n" if /^(.*)_(config|ope)/' | uniq); do
+    printf " --> ISE Device found: $DEV: "
+    if [ $(find "$DIR" -iname "${DEV}*" | wc -l) -gt $((MIN_COUNT+1)) ]; then
+      printf " More than $AGE backup found. Cleanup...\n"
+      [ $TRY -eq 0 ] && find "$DIR" -iname "*${DEV}*" -mtime +$AGE -delete
+    else
+      printf " No clean-up needed\n"
+    fi
+  done
+}
+
+backup_clean_netscaler() {
+  DIR=$1
+  for DEV in $(ls -1 $DIR | perl -ne 'print "$1\n" if /^([0-9a-z]+)_([0-9]+).tgz$/i' | uniq); do
+    printf " --> Netscaler Device found: $DEV: "
+    if [ $(find "$DIR" -iname "${DEV}*" | wc -l) -gt $((MIN_COUNT+1)) ]; then
+      printf " More than $AGE backup found. Cleanup...\n"
+      [ $TRY -eq 0 ] && find "$DIR" -iname "*${DEV}*" -mtime +$AGE -delete
+    else
+      printf " No clean-up needed\n"
+    fi
+  done
+}
+
+backup_clean_bigip() {
+  DIR=$1
+  for DEV in $(ls -1 $DIR | perl -ne 'print "$1\n" if /^([0-9a-z]+)_([0-9]+).ucs$/i' | uniq); do
+    printf " --> F5(Bigip) device found: $DEV: "
+    if [ $(find "$DIR" -iname "${DEV}*" | wc -l) -gt $((MIN_COUNT+1)) ]; then
+      printf " More than $AGE backup found. Cleanup...\n"
+      [ $TRY -eq 0 ] && find "$DIR" -iname "*${DEV}*" -mtime +$AGE -delete
+    else
+      printf " No clean-up needed\n"
+    fi
+  done
+}
+
+backup_clean_algosec() {
+  DIR=$1
+
+  for DEV in $(basename $(find "${DIR}" -maxdepth 1 -mindepth 1 -type d)); do
+    printf " --> Device found: $DEV: "
+    if [ $(find  "${DIR}/${DEV}/static/" -maxdepth 1 -mindepth 1 -type d | wc -l) -gt $((MIN_COUNT+1)) ]; then
+      printf " More than $AGE backup found. Cleanup...\n"
+      [ $TRY -eq 0 ] && find "${DIR}/${DEV}/static/" -maxdepth 1 -mindepth 1 -mtime +$AGE -exec rm -rf {} \;
+    else
+      printf " No clean-up needed\n"
+    fi 
+  done
+}
+
+backup_clean_default() {
+  DIR=$1
+  for DEV in $(find "${DIR}" -type f -exec basename {} \; | perl -ne 'print "$1\n" if /^([^\.]*)\..*$/' | sort | uniq); do
+    printf " --> Device found: $DEV: "
+    if [ $(find "${DIR}" -iname "${DEV}.*" | wc -l) -gt $((MIN_COUNT+1)) ]; then
+      printf " More than $AGE backup found. Cleanup...\n"
+      [ $TRY -eq 0 ] && find "${DIR}" -iname "*${DEV}*" -mtime +$AGE -delete
+    else
+      printf " No clean-up needed\n"
+    fi
+  done
+}
+
+for DIR in $(find "${MAN_BACK}/" -mindepth 1 -maxdepth 1 -type d -exec basename '{}' \;); do
+  printf "Check in dir ${MAN_BACK}/${DIR}:\n"
+  DIR_LC=$(echo "$DIR" | tr '[:upper:]' '[:lower:]')
+  type backup_clean_${DIR_LC} > /dev/null 2>&1
+  if [ $? -eq 0 ]; then
+    backup_clean_${DIR_LC} "${MAN_BACK}/${DIR}"
+  else
+    backup_clean_default "${MAN_BACK}/${DIR}"
+  fi
+done
+     
+
