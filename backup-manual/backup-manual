@@ -11,7 +11,6 @@ MIN_COUNT=7
 MAX_AGE=7
 STDDBG="> /dev/null 2>&1"
 VERSION=0.4
-LOGGER="logger -t backup_manual"
 USE_SFTP=1
 USE_SCP=0
 USE_FTP=1
@@ -70,7 +69,6 @@ while getopts "Vhtdr:c:f:" opt; do
             ;;
         d)
             DEBUG=1
-            LOGGER="logger -t backup_manual --stderr"
             STDDBG=""
             ;;
         r)
@@ -118,12 +116,12 @@ bigip_backup() {
     DEV=$(echo $2 | tr '[:upper:]' '[:lower:]')
 
     # Perform backup
-    $LOGGER "Manuel backup for device ${DEV}"
+    printf " --> Manuel backup for device ${DEV}: "
     l_BACKUP_FILE="${DEV}_$(date +%Y%m%d)"
 
     if [ -f "${DIR}/${l_BACKUP_FILE}.ucs" ]; then
         if [ "$(($(date +%s) - $(stat -c %Y "${DIR}/${l_BACKUP_FILE}.ucs")))" -lt $((24*60*60)) ]; then
-            $LOGGER "Backup file for device ${DEV} already exist"
+            printf "Backup already exist. Skip...\n"
             return
         fi
     fi
@@ -132,9 +130,9 @@ bigip_backup() {
     l_CMD="${RANCID_BIN}/clogin -t 600 -c 'tmsh save /sys ucs /var/tmp/${l_BACKUP_FILE}.ucs > /dev/null;${l_COPY_CMD};rm -f /var/tmp/${l_BACKUP_FILE}.ucs' ${DEV} ${STDDBG}"
     if [ $TRY -eq 0 ]; then
         eval ${l_CMD}
-        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}.ucs" ] && $LOGGER "Backup for device ${DEV} fail" || $LOGGER "Backup for device ${DEV} successfull"
+        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}.ucs" ] && printf "fail\n" || printf "successfull\n"
     else
-        printf "${l_CMD}\n"
+        printf "\n${l_CMD}\n"
     fi
 
     # Remove empty files if required
@@ -148,12 +146,12 @@ netscaler_backup() {
     DEV=$(echo $2 | tr '[:upper:]' '[:lower:]')
 
     # Perform backup
-    $LOGGER "Manual backup for device ${DEV}"
+    printf " --> Manual backup for device ${DEV}: "
     l_BACKUP_FILE="${DEV}_$(date +%Y%m%d)"
 
     if [ -f "${DIR}/${l_BACKUP_FILE}.tgz" ]; then
         if [ "$(($(date +%s) - $(stat -c %Y "${DIR}/${l_BACKUP_FILE}.tgz")))" -lt $((24*60*60)) ]; then
-            $LOGGER "Backup file for device ${DEV} already exist"
+            printf "Backup already exist. Skip...\n"
             return
         fi
     fi
@@ -162,9 +160,9 @@ netscaler_backup() {
     l_CMD="${RANCID_BIN}/nslogin -t 600 -c 'rm system backup ${DEV}_$(date --date=yesterday +%Y%m%d).tgz;create system backup ${l_BACKUP_FILE} -level full;shell;${l_COPY_CMD};rm system backup ${DEV}_$(date +%Y%m%d).tgz;logout' ${DEV} ${STDDBG}"
     if [ $TRY -eq 0 ]; then
         eval ${l_CMD}
-        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}.tgz" ] && $LOGGER "Backup for device ${DEV} fail" || $LOGGER "Backup for device ${DEV} successfull"
+        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}.tgz" ] && printf "fail\n" || printf "successfull\n"
     else
-        printf "${l_CMD}\n"
+        printf "\n${l_CMD}\n"
     fi
 
     # Remove empty files if required
@@ -178,22 +176,56 @@ fortigate_backup() {
     DEV=$(echo $2 | tr '[:upper:]' '[:lower:]')
 
     # Perform backup
-    $LOGGER "Manuel backup for device ${DEV}"
+    printf " --> Manuel backup for device ${DEV}: "
     l_BACKUP_FILE="${DEV}_$(date +%Y%m%d)"
 
     if [ -f "${DIR}/${l_BACKUP_FILE}" ]; then
         if [ "$(($(date +%s) - $(stat -c %Y "${DIR}/${l_BACKUP_FILE}")))" -lt $((24*60*60)) ]; then
-            $LOGGER "Backup file for device ${DEV} already exist"
+            printf "Backup already exist. Skip...\n"
             return
         fi
     fi
 
-    l_CMD="${RANCID_BIN}/fnlogin -t 600 -c 'config global;execute backup config ftp /$(basename ${DIR})/${l_BACKUP_FILE} ${BACK_SRV} ${BACK_FTP_USR} ${BACK_FTP_PWD}' ${DEV} ${STDDBG}"
+    # Check type of backup
+    SN=$(${RANCID_BIN}/fnlogin -t 600 -c 'get system status' ${DEV} | awk -F'[[:blank:]]*:[[:blank:]]*' '/^Serial[ -]Number/{print $2}')
+
+    if [ $(expr "$SN" : '^FG[0-9]\+') -gt 0 ]; then
+        # Backup command for Fortigate
+        FG_BCK_CMD="execute backup config ftp /$(basename ${DIR})/${l_BACKUP_FILE} ${BACK_SRV}"
+    elif [ $(expr "$SN" : '^FMG') -eq 3 ]; then
+        # Backup command for fortimanager
+        FG_BCK_CMD="execute backup all-settings ftp ${BACK_SRV} /$(basename ${DIR})/${l_BACKUP_FILE}"
+    elif [ $(expr "$SN" : '^FAZ') -eq 3 ]; then
+        # Backup command for fortianalyzer
+        FG_BCK_CMD="execute backup all-settings ftp ${BACK_SRV} /$(basename ${DIR})/${l_BACKUP_FILE}"
+    else
+        printf "Type of fortinet not managed ($SN). Skip...\n"
+        return
+    fi
+
+    l_CMD="${RANCID_BIN}/fnlogin -t 600 -c 'config global;${FG_BCK_CMD} ${BACK_FTP_USR} ${BACK_FTP_PWD}' ${DEV} ${STDDBG}"
     if [ $TRY -eq 0 ]; then
         eval ${l_CMD}
-        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}" ] && $LOGGER "Backup for device ${DEV} fail" || $LOGGER "Backup for device ${DEV} successfull"
+        [ $? -eq 0 ] && {
+            # For an unknow reason, the backup for fortimanager and fortianalyzer is done in background.
+            # So, we need to wait few time to see the backup file appear in directory
+            # I have arbitrary choose to wait 1 minute
+            COUNT=0
+            while true; do
+                if [ -f "${DIR}/${l_BACKUP_FILE}" ]; then
+                    printf "successfull\n"
+                    break
+                elif [ $COUNT -gt 30 ]; then
+                    printf "fail\n"
+                    break
+                else
+                    COUNT=$(($COUNT + 1))
+                fi
+                sleep 2s
+            done
+        } || printf "fail\n"
     else
-        printf "${l_CMD}\n"
+        printf "\n${l_CMD}\n"
     fi
 
     # Remove empty files if required
@@ -206,12 +238,12 @@ aruba_backup() {
     DEV=$(echo $2 | tr '[:upper:]' '[:lower:]')
 
     # Perform backup
-    $LOGGER "Manuel backup for device ${DEV}"
+    printf " --> Manuel backup for device ${DEV}: "
     l_BACKUP_FILE="${DEV}_$(date +%Y%m%d)"
 
     if [ -f "${DIR}/${l_BACKUP_FILE}.tar.gz" ]; then
         if [ "$(($(date +%s) - $(stat -c %Y "${DIR}/${l_BACKUP_FILE}.tar.gz")))" -lt $((24*60*60)) ]; then
-            $LOGGER "Backup file for device ${DEV} already exist"
+            printf "Backup already exist. Skip...\n"
             return
         fi
     fi
@@ -219,9 +251,9 @@ aruba_backup() {
     l_CMD="${RANCID_BIN}/clogin -t 600 -c 'backup flash;copy flash: flashbackup.tar.gz ftp: ${BACK_SRV_IP} ${BACK_FTP_USR} /$(basename ${DIR}) ${l_BACKUP_FILE}.tar.gz;${BACK_FTP_PWD};delete filename flashbackup.tar.gz' ${DEV} ${STDDBG}"
     if [ $TRY -eq 0 ]; then
         eval ${l_CMD}
-        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}.tar.gz" ] && $LOGGER "Backup for device ${DEV} fail" || $LOGGER "Backup for device ${DEV} successfull"
+        [ $? -ne 0 -o ! -f "${DIR}/${l_BACKUP_FILE}.tar.gz" ] && printf "fail\n" || printf "successfull\n"
     else
-        printf "${l_CMD}\n"
+        printf "\n${l_CMD}\n"
     fi
 
     # Remove empty files if required
